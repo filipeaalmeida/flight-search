@@ -19,7 +19,7 @@ Use `--help` when you just need to confirm a flag name or value — it's cheaper
 ## Three subcommands
 
 - `explore` → SerpApi `google_travel_explore`. Use for destination discovery (flexible origin and/or destination), area-based searches, month-based flexible dates, or flexible-date searches on a specific route (pass `--to`). Writes cache JSON only.
-- `search` → SerpApi `google_flights`. Use for specific route + specific dates, one-way, round trip, or multi-city. Writes cache JSON only.
+- `search` → SerpApi `google_flights`. Use for specific route + specific dates, one-way, round trip, or multi-city. Writes cache JSON only. For round trips, it automatically follows SerpApi's `departure_token` flow to fetch compatible return flights and persist complete itineraries.
 - `report` → consolidates one or more cache files into a single filterable HTML dashboard. Always the last call of a user turn.
 
 ## Picking the right command
@@ -44,6 +44,7 @@ The CLI stores each response in `~/.flight-search/<hash>.json` keyed by the full
 - Use `--no-cache` only for a forced refresh.
 - Default TTL is 12 hours; override with `--cache-ttl <hours>`.
 - Prefer one `explore` call over many `search` calls when the user is still deciding.
+- Round-trip `search` uses additional cached SerpApi calls: one `departure_token` call per outbound option being completed. Use `--limit <n>` when you intentionally want to cap how many outbound options get completed.
 
 Inspect cached results manually:
 
@@ -93,6 +94,9 @@ Set `DEFAULT_CURRENCY` in `~/.flight-search/.env` (e.g., `DEFAULT_CURRENCY=BRL`)
 ```bash
 # Round trip
 "$SKILL_DIR/.venv/bin/python" "$SKILL_DIR/search.py" search --from JFK --to LIS --depart 2026-05-15 --return 2026-05-22
+
+# Round trip, completing only the cheapest outbound option to save quota
+"$SKILL_DIR/.venv/bin/python" "$SKILL_DIR/search.py" search --from GRU --to MIA --depart 2026-05-28 --return 2026-06-03 --sort-by price --limit 1
 
 # One way
 "$SKILL_DIR/.venv/bin/python" "$SKILL_DIR/search.py" search --from JFK --to LIS --depart 2026-05-15 --oneway

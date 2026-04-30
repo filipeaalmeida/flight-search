@@ -15,8 +15,8 @@ It returns results with prices, stops, duration, CO₂, and links to Google Flig
 ## Features
 
 - **Both search modes** — flexible destination/date discovery (`google_travel_explore`) and specific route search (`google_flights`).
-- **Full API coverage** — month-based flexibility, time-of-day windows, layover ranges, hubs to exclude, airline include/exclude, sort, low-emissions filter, multi-city, cabin class, passengers, bags. Run `search.py --help` for the full flag list.
-- **Consolidated filterable HTML** — `search.py report <cache_files...>` merges any number of searches into a single dashboard with client-side filters (origin, destination, airline, stops, price range, date range) and sortable columns. `explore` / `search` only write cache JSON; the HTML is always built by one `report` call at the end.
+- **Full API coverage** — month-based flexibility, time-of-day windows, layover ranges, hubs to exclude, airline include/exclude, sort, low-emissions filter, multi-city, cabin class, passengers, bags. Round-trip searches automatically follow SerpApi's `departure_token` flow to fetch compatible return flights. Run `search.py --help` for the full flag list.
+- **Consolidated filterable HTML** — `search.py report <cache_files...>` merges any number of searches into a single dashboard with client-side filters (origin, destination, airline, stops, price range, date range) and sortable columns. Round-trip rows show outbound and return leg details together. `explore` / `search` only write cache JSON; the HTML is always built by one `report` call at the end.
 - **Client-side cache** — each response is saved in `~/.flight-search/<hash>.json` keyed by the full parameter set. Identical queries reuse the cache instead of burning SerpApi quota (default TTL 12h, override with `--cache-ttl`, bypass with `--no-cache`). SerpApi's free tier is 250 searches/month — this matters.
 - **Self-contained venv** — `setup.sh` creates `.venv/` inside the skill directory so the skill never touches system Python (PEP 668-safe on macOS and modern Linux).
 - **Assistant-driven setup** — on first run the skill creates a placeholder `.env` and the agent walks the user through pasting the SerpApi key (or the user edits the file directly).
@@ -91,6 +91,9 @@ PY="$SKILL_DIR/.venv/bin/python"
 
 # specific route, specific dates, sort by price
 "$PY" "$SKILL_DIR/search.py" search --from JFK --to LIS --depart 2026-05-15 --return 2026-05-22 --sort-by price
+
+# round trip with return-flight details, capped to the cheapest outbound option
+"$PY" "$SKILL_DIR/search.py" search --from GRU --to MIA --depart 2026-05-28 --return 2026-06-03 --sort-by price --limit 1
 
 # consolidate everything above into one filterable HTML dashboard
 "$PY" "$SKILL_DIR/search.py" report ~/.flight-search/*.json

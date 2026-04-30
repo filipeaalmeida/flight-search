@@ -16,6 +16,7 @@ SERPAPI_URL = "https://serpapi.com/search.json"
 CACHE_DIR = Path.home() / ".flight-search"
 OUTPUT_DIR = CACHE_DIR / "output"
 DEFAULT_CACHE_TTL_HOURS = 12
+ROUND_TRIP_DETAILS_VERSION = 1
 
 INTEREST_MAP = {
     "beaches": "/m/0b3yr",
@@ -173,7 +174,7 @@ REPORT_TEMPLATE = """<!DOCTYPE html>
   * {{ margin: 0; padding: 0; box-sizing: border-box; }}
   body {{
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-    background: #0f172a; color: #e2e8f0; padding: 24px;
+    background: #0f172a; color: #e2e8f0; padding: 24px; overflow-x: auto;
   }}
   .header {{ margin-bottom: 20px; padding-bottom: 14px; border-bottom: 1px solid #334155; }}
   .header h1 {{ font-size: 22px; color: #f8fafc; margin-bottom: 4px; }}
@@ -294,7 +295,7 @@ function applyFilters() {{
   rows.forEach(tr => {{
     const origin = tr.dataset.origin || '';
     const dest = tr.dataset.dest || '';
-    const airline = tr.dataset.airline || '';
+    const airlineList = tr.dataset.airlines || '';
     const stopKey = tr.dataset.stopkey || '';
     const price = parseFloat(tr.dataset.price || 'NaN');
     const date = tr.dataset.date || '';
@@ -302,7 +303,7 @@ function applyFilters() {{
     const pass =
       (origins.size === 0 || origins.has(origin)) &&
       (dests.size === 0 || dests.has(dest)) &&
-      (airlines.size === 0 || airlines.has(airline)) &&
+      (airlines.size === 0 || Array.from(airlines).some(a => airlineList.includes('|' + a + '|'))) &&
       (stops.size === 0 || stops.has(stopKey)) &&
       (isNaN(price) || price >= pMin) &&
       (isNaN(price) || price <= pMax) &&
@@ -453,6 +454,11 @@ def cache_write(key: str, params: dict, response: dict) -> None:
     cache_path(key).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def api_request_params(params: dict) -> dict:
+    """Strip local cache/reporting controls before calling SerpApi."""
+    return {k: v for k, v in params.items() if not k.startswith("_")}
+
+
 def api_call(params: dict, use_cache: bool = True, ttl_hours: int = DEFAULT_CACHE_TTL_HOURS) -> tuple[dict, str, Path]:
     key = cache_key(params)
     cfile = cache_path(key)
@@ -462,7 +468,7 @@ def api_call(params: dict, use_cache: bool = True, ttl_hours: int = DEFAULT_CACH
         if cached is not None:
             return cached, "hit", cfile
 
-    response = requests.get(SERPAPI_URL, params=params, timeout=30)
+    response = requests.get(SERPAPI_URL, params=api_request_params(params), timeout=30)
     if response.status_code != 200:
         print(f"API error ({response.status_code}): {response.text[:500]}")
         sys.exit(1)
@@ -636,6 +642,8 @@ def build_explore_params(origin: str, args: argparse.Namespace, api_key: str) ->
         params["infants_on_lap"] = args.infants_on_lap
     if args.infants_in_seat:
         params["infants_in_seat"] = args.infants_in_seat
+    if args.limit:
+        params["_limit"] = args.limit
     return params
 
 
@@ -716,6 +724,8 @@ def build_search_params(args: argparse.Namespace, api_key: str) -> dict:
         params["exclude_basic"] = "true"
     if args.deep_search:
         params["deep_search"] = "true"
+    if args.limit:
+        params["_limit"] = args.limit
     return params
 
 
@@ -727,6 +737,128 @@ def collect_flights(data: dict) -> list[dict]:
         return best + other
     flights = data.get("flights", []) or []
     return flights
+
+
+def collect_flight_entries(data: dict) -> list[tuple[dict, bool]]:
+    entries: list[tuple[dict, bool]] = []
+    for f in data.get("best_flights") or []:
+        entries.append((f, True))
+    for f in data.get("other_flights") or []:
+        entries.append((f, False))
+    if not entries:
+        for f in data.get("flights") or []:
+            entries.append((f, bool(f.get("cheapest_flight"))))
+    return entries
+
+
+def local_limit(params: dict) -> int | None:
+    value = params.get("_limit")
+    if value is None:
+        return None
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        print(f"Invalid local limit in cache params: {value}", file=sys.stderr)
+        sys.exit(1)
+    return n if n > 0 else None
+
+
+def is_initial_round_trip_search(params: dict) -> bool:
+    return (
+        params.get("engine") == "google_flights"
+        and str(params.get("type")) == "1"
+        and bool(params.get("return_date"))
+        and not params.get("departure_token")
+    )
+
+
+def complete_round_trip_details(
+    data: dict,
+    params: dict,
+    *,
+    use_cache: bool,
+    ttl_hours: int,
+) -> tuple[int, int, dict[str, int]]:
+    """Fetch return-flight options for each outbound option using departure_token."""
+    if not is_initial_round_trip_search(params):
+        return 0, 0, {}
+
+    details = data.get("_round_trip_details") or {}
+    if details.get("version") == ROUND_TRIP_DETAILS_VERSION:
+        return details.get("outbound_options", 0), len(data.get("round_trip_options") or []), {}
+
+    outbound_entries = collect_flight_entries(data)
+    limit = local_limit(params)
+    if limit is not None:
+        outbound_entries = outbound_entries[:limit]
+
+    if not outbound_entries:
+        return 0, 0, {}
+
+    options: list[dict] = []
+    cache_counts = {"hit": 0, "miss": 0}
+    missing_tokens = 0
+    empty_returns = 0
+
+    for idx, (outbound, outbound_is_best) in enumerate(outbound_entries, start=1):
+        token = outbound.get("departure_token")
+        if not token:
+            missing_tokens += 1
+            continue
+
+        return_params = {
+            k: v for k, v in params.items()
+            if not k.startswith("_") and k != "api_key"
+        }
+        return_params["api_key"] = params["api_key"]
+        return_params["departure_token"] = token
+
+        return_data, cache_info, return_cache = api_call(
+            return_params,
+            use_cache=use_cache,
+            ttl_hours=ttl_hours,
+        )
+        cache_counts[cache_info] = cache_counts.get(cache_info, 0) + 1
+        return_entries = collect_flight_entries(return_data)
+        if not return_entries:
+            empty_returns += 1
+            continue
+
+        link = (return_data.get("search_metadata") or {}).get("google_flights_url", "")
+        for return_flight, return_is_best in return_entries:
+            options.append({
+                "outbound_index": idx,
+                "outbound": outbound,
+                "return": return_flight,
+                "price": return_flight.get("price") if return_flight.get("price") is not None else outbound.get("price"),
+                "outbound_price_hint": outbound.get("price"),
+                "is_best": outbound_is_best or return_is_best,
+                "link": link,
+                "return_cache": str(return_cache),
+            })
+
+    if missing_tokens:
+        print(
+            f"  Warning: {missing_tokens} outbound option(s) lacked departure_token and could not be completed.",
+            file=sys.stderr,
+        )
+    if empty_returns:
+        print(
+            f"  Warning: {empty_returns} outbound option(s) returned no compatible return flights.",
+            file=sys.stderr,
+        )
+    if not options and outbound_entries:
+        print("Round-trip search returned outbound options, but no complete return itineraries.", file=sys.stderr)
+        sys.exit(1)
+
+    data["round_trip_options"] = options
+    data["_round_trip_details"] = {
+        "version": ROUND_TRIP_DETAILS_VERSION,
+        "completed_at": datetime.now().isoformat(),
+        "outbound_options": len(outbound_entries),
+        "itinerary_options": len(options),
+    }
+    return len(outbound_entries), len(options), cache_counts
 
 
 def cmd_explore(args: argparse.Namespace) -> None:
@@ -781,7 +913,25 @@ def cmd_search(args: argparse.Namespace) -> None:
         print("No flights found.")
         return
 
-    print(f"  {len(flights)} options found ({cache_info})")
+    completed_outbounds, completed_options, return_cache_counts = complete_round_trip_details(
+        data,
+        params,
+        use_cache=not args.no_cache,
+        ttl_hours=args.cache_ttl,
+    )
+    if completed_outbounds:
+        cache_write(cache_key(params), params, data)
+        cache_info_bits = ", ".join(
+            f"{count} {status}" for status, count in sorted(return_cache_counts.items()) if count
+        )
+        suffix = f" ({cache_info_bits})" if cache_info_bits else ""
+        print(
+            f"  Completed {completed_options} round-trip itinerary option(s) "
+            f"from {completed_outbounds} outbound option(s){suffix}"
+        )
+
+    result_count = completed_options if completed_options else len(flights)
+    print(f"  {result_count} options found ({cache_info})")
     print(f"  Data:  {cache_file}")
     print()
     print("To build a consolidated HTML dashboard, run:")
@@ -834,8 +984,17 @@ def _explore_dest_to_row(d: dict, origin: str, currency: str) -> dict:
         "duration_min": _safe_int(d.get("flight_duration")),
         "stops": _safe_int(d.get("number_of_stops")),
         "airline": d.get("airline") or "",
+        "airlines_filter": [d.get("airline")] if d.get("airline") else [],
         "departure_time": "",
         "arrival_time": "",
+        "outbound_duration_min": _safe_int(d.get("flight_duration")),
+        "outbound_stops": _safe_int(d.get("number_of_stops")),
+        "outbound_airline": d.get("airline") or "",
+        "return_duration_min": 0,
+        "return_stops": "",
+        "return_airline": "",
+        "return_departure_time": "",
+        "return_arrival_time": "",
         "co2_kg": None,
         "link": d.get("link") or "",
         "is_best": False,
@@ -874,16 +1033,32 @@ def _explore_flight_to_row(
         "duration_min": _safe_int(f.get("duration")),
         "stops": _safe_int(f.get("number_of_stops")),
         "airline": f.get("airline") or "",
+        "airlines_filter": [f.get("airline")] if f.get("airline") else [],
         "departure_time": "",
         "arrival_time": "",
+        "outbound_duration_min": _safe_int(f.get("duration")),
+        "outbound_stops": _safe_int(f.get("number_of_stops")),
+        "outbound_airline": f.get("airline") or "",
+        "return_duration_min": 0,
+        "return_stops": "",
+        "return_airline": "",
+        "return_departure_time": "",
+        "return_arrival_time": "",
         "co2_kg": None,
         "link": f.get("google_flights_link") or f.get("link") or fallback_link,
         "is_best": bool(f.get("cheapest_flight")),
     }
 
 
-def _search_flight_to_row(f: dict, origin_fb: str, dest_fb: str, currency: str, fallback_link: str) -> dict:
-    """google_flights flight schema: nested segments, total_duration."""
+def _split_datetime(value: str) -> tuple[str, str]:
+    if not value:
+        return "", ""
+    if " " in value:
+        return value.split(" ", 1)
+    return "", value
+
+
+def _flight_leg_summary(f: dict, origin_fb: str, dest_fb: str) -> dict:
     segs = f.get("flights") or []
     airlines = list(dict.fromkeys(s.get("airline") or "" for s in segs if s.get("airline")))
     first = segs[0] if segs else {}
@@ -892,29 +1067,104 @@ def _search_flight_to_row(f: dict, origin_fb: str, dest_fb: str, currency: str, 
     arr_ap = last.get("arrival_airport") or {}
     dep_full = dep_ap.get("time") or ""
     arr_full = arr_ap.get("time") or ""
-    depart_date = dep_full.split(" ", 1)[0] if " " in dep_full else ""
-    dep_time = dep_full.split(" ", 1)[1] if " " in dep_full else dep_full
-    arr_time = arr_full.split(" ", 1)[1] if " " in arr_full else arr_full
+    depart_date, dep_time = _split_datetime(dep_full)
+    arrival_date, arr_time = _split_datetime(arr_full)
     co2 = (f.get("carbon_emissions") or {}).get("this_flight")
     return {
-        "type": "search",
         "origin": dep_ap.get("id") or origin_fb,
         "dest": arr_ap.get("id") or dest_fb,
+        "depart_date": depart_date,
+        "arrival_date": arrival_date,
+        "departure_time": dep_time,
+        "arrival_time": arr_time,
+        "duration_min": _safe_int(f.get("total_duration")),
+        "stops": max(len(segs) - 1, 0),
+        "airline": ", ".join(airlines),
+        "airlines": airlines,
+        "co2_kg": (co2 // 1000) if co2 else None,
+    }
+
+
+def _days_between(start: str, end: str) -> str:
+    if not start or not end:
+        return ""
+    try:
+        return str((datetime.strptime(end, "%Y-%m-%d") - datetime.strptime(start, "%Y-%m-%d")).days)
+    except ValueError:
+        return ""
+
+
+def _search_flight_to_row(f: dict, origin_fb: str, dest_fb: str, currency: str, fallback_link: str) -> dict:
+    """google_flights one-way or incomplete round-trip flight schema."""
+    leg = _flight_leg_summary(f, origin_fb, dest_fb)
+    return {
+        "type": "search",
+        "origin": leg["origin"],
+        "dest": leg["dest"],
         "city": "",
         "country": "",
         "price": f.get("price"),
         "currency": currency,
-        "depart_date": depart_date,
+        "depart_date": leg["depart_date"],
         "return_date": "",
         "days": "",
-        "duration_min": _safe_int(f.get("total_duration")),
-        "stops": max(len(segs) - 1, 0),
-        "airline": ", ".join(airlines),
-        "departure_time": dep_time,
-        "arrival_time": arr_time,
-        "co2_kg": (co2 // 1000) if co2 else None,
+        "duration_min": leg["duration_min"],
+        "stops": leg["stops"],
+        "airline": leg["airline"],
+        "airlines_filter": leg["airlines"],
+        "departure_time": leg["departure_time"],
+        "arrival_time": leg["arrival_time"],
+        "outbound_duration_min": leg["duration_min"],
+        "outbound_stops": leg["stops"],
+        "outbound_airline": leg["airline"],
+        "return_duration_min": 0,
+        "return_stops": "",
+        "return_airline": "",
+        "return_departure_time": "",
+        "return_arrival_time": "",
+        "co2_kg": leg["co2_kg"],
         "link": fallback_link,
         "is_best": False,
+    }
+
+
+def _round_trip_option_to_row(option: dict, origin_fb: str, dest_fb: str, currency: str, params: dict) -> dict:
+    outbound = _flight_leg_summary(option.get("outbound") or {}, origin_fb, dest_fb)
+    returning = _flight_leg_summary(option.get("return") or {}, dest_fb, origin_fb)
+    depart_date = outbound["depart_date"] or params.get("outbound_date") or ""
+    return_date = returning["depart_date"] or params.get("return_date") or ""
+    co2_values = [v for v in (outbound["co2_kg"], returning["co2_kg"]) if isinstance(v, int)]
+    airlines_filter = list(dict.fromkeys(outbound["airlines"] + returning["airlines"]))
+    outbound_label = outbound["airline"] or "—"
+    return_label = returning["airline"] or "—"
+    return {
+        "type": "round-trip",
+        "origin": outbound["origin"] or origin_fb,
+        "dest": outbound["dest"] or dest_fb,
+        "city": "",
+        "country": "",
+        "price": option.get("price"),
+        "currency": currency,
+        "depart_date": depart_date,
+        "return_date": return_date,
+        "days": _days_between(depart_date, return_date),
+        "duration_min": outbound["duration_min"] + returning["duration_min"],
+        "stops": max(outbound["stops"], returning["stops"]),
+        "airline": f"{outbound_label} / {return_label}",
+        "airlines_filter": airlines_filter,
+        "departure_time": outbound["departure_time"],
+        "arrival_time": outbound["arrival_time"],
+        "outbound_duration_min": outbound["duration_min"],
+        "outbound_stops": outbound["stops"],
+        "outbound_airline": outbound["airline"],
+        "return_duration_min": returning["duration_min"],
+        "return_stops": returning["stops"],
+        "return_airline": returning["airline"],
+        "return_departure_time": returning["departure_time"],
+        "return_arrival_time": returning["arrival_time"],
+        "co2_kg": sum(co2_values) if co2_values else None,
+        "link": option.get("link") or "",
+        "is_best": bool(option.get("is_best")),
     }
 
 
@@ -944,6 +1194,19 @@ def cache_to_rows(cache_entry: dict) -> list[dict]:
         for f in response.get("other_flights") or []:
             rows.append(_explore_flight_to_row(f, origin, dest, currency, exp_start, exp_link))
     elif engine == "google_flights":
+        if is_initial_round_trip_search(params):
+            round_trip_options = response.get("round_trip_options") or []
+            if not round_trip_options and any(f.get("departure_token") for f in collect_flights(response)):
+                print(
+                    "report: round-trip cache only has outbound flights. "
+                    "Re-run `search` for that route so return flights can be fetched with departure_token.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            for option in round_trip_options:
+                rows.append(_round_trip_option_to_row(option, origin, dest, currency, params))
+            return rows
+
         fallback_link = (response.get("search_metadata") or {}).get("google_flights_url", "")
         for f in response.get("best_flights") or []:
             r = _search_flight_to_row(f, origin, dest, currency, fallback_link)
@@ -954,6 +1217,9 @@ def cache_to_rows(cache_entry: dict) -> list[dict]:
         for f in response.get("flights") or []:
             rows.append(_search_flight_to_row(f, origin, dest, currency, fallback_link))
 
+    limit = local_limit(params)
+    if limit is not None:
+        rows = rows[:limit]
     return rows
 
 
@@ -975,13 +1241,16 @@ def render_report_html(rows: list[dict], title: str, sources: list[dict]) -> str
     unique_origins = sorted({r["origin"] for r in rows if r.get("origin")})
     unique_dests = sorted({r["dest"] for r in rows if r.get("dest")})
     unique_airlines = sorted({
-        a.strip() for r in rows for a in (r["airline"].split(",") if r.get("airline") else []) if a.strip()
+        a.strip()
+        for r in rows
+        for a in (r.get("airlines_filter") or [])
+        if a and a.strip()
     })
 
     origin_counts = {o: sum(1 for r in rows if r["origin"] == o) for o in unique_origins}
     dest_counts = {d: sum(1 for r in rows if r["dest"] == d) for d in unique_dests}
     airline_counts = {
-        a: sum(1 for r in rows if a in (r.get("airline") or "")) for a in unique_airlines
+        a: sum(1 for r in rows if a in (r.get("airlines_filter") or [])) for a in unique_airlines
     }
 
     summary_cards = (
@@ -1027,13 +1296,17 @@ def render_report_html(rows: list[dict], title: str, sources: list[dict]) -> str
         ("City", "", "string"),
         ("Country", "", "string"),
         ("Price", "right", "number"),
-        ("Depart", "", "string"),
-        ("Return", "", "string"),
-        ("Duration", "", "number"),
-        ("Stops", "center", "number"),
-        ("Airline", "", "string"),
-        ("Dep", "", "string"),
-        ("Arr", "", "string"),
+        ("Out Date", "", "string"),
+        ("Out Time", "", "string"),
+        ("Out Dur", "", "number"),
+        ("Out Stops", "center", "number"),
+        ("Out Airline", "", "string"),
+        ("Return Date", "", "string"),
+        ("Return Time", "", "string"),
+        ("Return Dur", "", "number"),
+        ("Return Stops", "center", "number"),
+        ("Return Airline", "", "string"),
+        ("Days", "right", "number"),
         ("CO₂", "right", "number"),
         ("Link", "center", "string"),
     ]
@@ -1044,7 +1317,8 @@ def render_report_html(rows: list[dict], title: str, sources: list[dict]) -> str
 
     def _row_html(i: int, r: dict) -> str:
         stopkey = "0" if r["stops"] == 0 else ("1" if r["stops"] == 1 else "2")
-        airline_key = (r["airline"].split(",")[0].strip()) if r.get("airline") else ""
+        airline_values = [a for a in (r.get("airlines_filter") or []) if a]
+        airline_dataset = "|" + "|".join(airline_values) + "|" if airline_values else ""
         price = r.get("price")
         price_str = format_price(price, r["currency"]) if isinstance(price, (int, float)) else "—"
         link_html = f'<a href="{r["link"]}" target="_blank">Google</a>' if r.get("link") else "—"
@@ -1052,9 +1326,26 @@ def render_report_html(rows: list[dict], title: str, sources: list[dict]) -> str
         type_label = "Best" if r["is_best"] else r["type"]
         type_cls = "best" if r["is_best"] else "dim"
         price_sort = price if isinstance(price, (int, float)) else 0
+        out_duration = r.get("outbound_duration_min") or r.get("duration_min") or 0
+        out_stops = r.get("outbound_stops")
+        if out_stops == "":
+            out_stops = r.get("stops", "")
+        return_duration = r.get("return_duration_min") or 0
+        return_stops = r.get("return_stops")
+        out_stops_sort = out_stops if isinstance(out_stops, int) else 0
+        out_stops_display = str(out_stops) if isinstance(out_stops, int) else "—"
+        return_stops_sort = return_stops if isinstance(return_stops, int) else 0
+        return_stops_display = str(return_stops) if isinstance(return_stops, int) else "—"
+        out_time = r["departure_time"] or ""
+        if r.get("arrival_time"):
+            out_time = f'{out_time}→{r["arrival_time"]}' if out_time else r["arrival_time"]
+        return_time = r.get("return_departure_time") or ""
+        if r.get("return_arrival_time"):
+            return_time = f'{return_time}→{r["return_arrival_time"]}' if return_time else r["return_arrival_time"]
+        days_sort = int(r["days"]) if str(r.get("days") or "").isdigit() else 0
         return (
             f'<tr data-origin="{r["origin"]}" data-dest="{r["dest"]}" '
-            f'data-airline="{airline_key}" data-stopkey="{stopkey}" '
+            f'data-airlines="{airline_dataset}" data-stopkey="{stopkey}" '
             f'data-price="{price_sort if isinstance(price, (int, float)) else ""}" '
             f'data-date="{r["depart_date"]}">'
             f'<td class="idx dim" data-sortkey="{i}">{i}</td>'
@@ -1065,12 +1356,16 @@ def render_report_html(rows: list[dict], title: str, sources: list[dict]) -> str
             f'<td data-sortkey="{r["country"]}">{r["country"] or "—"}</td>'
             f'<td class="price" data-sortkey="{price_sort}">{price_str}</td>'
             f'<td class="date" data-sortkey="{r["depart_date"]}">{r["depart_date"] or "—"}</td>'
+            f'<td class="date" data-sortkey="{r["departure_time"]}">{out_time or "—"}</td>'
+            f'<td data-sortkey="{out_duration}">{format_duration(out_duration)}</td>'
+            f'<td class="center {stops_class(out_stops_sort)}" data-sortkey="{out_stops_sort}">{out_stops_display}</td>'
+            f'<td class="airline" data-sortkey="{r.get("outbound_airline") or r.get("airline") or ""}">{r.get("outbound_airline") or r.get("airline") or "—"}</td>'
             f'<td class="date" data-sortkey="{r["return_date"]}">{r["return_date"] or "—"}</td>'
-            f'<td data-sortkey="{r["duration_min"]}">{format_duration(r["duration_min"])}</td>'
-            f'<td class="center {stops_class(r["stops"])}" data-sortkey="{r["stops"]}">{r["stops"]}</td>'
-            f'<td class="airline" data-sortkey="{r["airline"]}">{r["airline"] or "—"}</td>'
-            f'<td class="date" data-sortkey="{r["departure_time"]}">{r["departure_time"] or "—"}</td>'
-            f'<td class="date" data-sortkey="{r["arrival_time"]}">{r["arrival_time"] or "—"}</td>'
+            f'<td class="date" data-sortkey="{r.get("return_departure_time") or ""}">{return_time or "—"}</td>'
+            f'<td data-sortkey="{return_duration}">{format_duration(return_duration) if return_duration else "—"}</td>'
+            f'<td class="center {stops_class(return_stops_sort)}" data-sortkey="{return_stops_sort}">{return_stops_display}</td>'
+            f'<td class="airline" data-sortkey="{r.get("return_airline") or ""}">{r.get("return_airline") or "—"}</td>'
+            f'<td class="right dim" data-sortkey="{days_sort}">{r.get("days") or "—"}</td>'
             f'<td class="right dim" data-sortkey="{r["co2_kg"] or 0}">{co2_str}</td>'
             f'<td class="center">{link_html}</td>'
             f'</tr>'
@@ -1082,17 +1377,18 @@ def render_report_html(rows: list[dict], title: str, sources: list[dict]) -> str
     sorted_rows = sorted(rows, key=_sortkey)
     tbody = "\n".join(_row_html(i + 1, r) for i, r in enumerate(sorted_rows))
 
-    source_parts = []
+    route_labels = set()
     for s in sources:
-        eng = s["engine"].replace("google_", "")
         lbl = s["origin"]
         if s.get("dest"):
             lbl += f"→{s['dest']}"
-        source_parts.append(f"{eng} ({lbl})")
+        if lbl:
+            route_labels.add(lbl)
+    route_count = len(route_labels)
     meta = (
         f'<span>Sources: <strong>{len(sources)}</strong></span>'
         f'<span>Currency: <strong>{currency}</strong></span>'
-        f'<span>{", ".join(source_parts)}</span>'
+        f'<span>Routes: <strong>{route_count}</strong></span>'
     )
 
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -1158,7 +1454,11 @@ def add_common_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("--currency", default=None, help="Currency (default: $DEFAULT_CURRENCY or USD)")
     p.add_argument("--hl", default="en", help="Response language (default: en)")
     p.add_argument("--gl", default="us", help="Country localization (default: us)")
-    p.add_argument("--limit", type=int, help="Limit number of result rows")
+    p.add_argument(
+        "--limit",
+        type=int,
+        help="Limit result rows; for round trips, cap outbound options completed via departure_token",
+    )
     p.add_argument("--adults", type=int, default=1, help="Adults (default: 1)")
     p.add_argument("--children", type=int, default=0, help="Children")
     p.add_argument("--infants-on-lap", type=int, default=0, help="Infants on lap")

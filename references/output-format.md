@@ -4,6 +4,8 @@
 
 `explore` and `search` only write cache JSON (at `~/.flight-search/<hash>.json`). They do **not** write HTML per call. A single consolidated HTML dashboard is produced by `report` at the end of the user's request, combining any number of cache files.
 
+For round-trip `search`, the cache must contain complete itineraries. The CLI first gets outbound options, then automatically calls SerpApi again with each `departure_token` to fetch compatible return flights. Do not preview or report outbound-only rows as if they were full round trips.
+
 The CLI never opens the browser. The skill drives the UX via a two-step AskUserQuestion (Claude Code) / `ask_user_question` (Codex) flow:
 
 ### Step 1 — Preview inline, then ask
@@ -84,9 +86,9 @@ HTML summary cards (in the dashboard, not the inline preview) highlight:
 Flight options table:
 
 ```text
-| # | Type | Origin | Destination | Price | Total Duration | Stops | Airlines | Departure | Arrival | CO₂ | Link |
-|---|------|--------|-------------|-------|----------------|-------|----------|-----------|---------|-----|------|
-| 1 | Best | JFK    | LIS         | $620  | 7h30           | 0     | TAP      | 21:30     | 09:00   | 450kg | Google |
+| # | Type | Origin | Destination | Price | Out Date | Out Time | Out Dur | Out Stops | Out Airline | Return Date | Return Time | Return Dur | Return Stops | Return Airline | Days | CO₂ | Link |
+|---|------|--------|-------------|-------|----------|----------|---------|-----------|-------------|-------------|-------------|------------|--------------|----------------|------|-----|------|
+| 1 | Best | JFK    | LIS         | $620  | 2026-05-15 | 21:30→09:00 | 7h30 | 0 | TAP | 2026-05-22 | 11:00→14:00 | 8h00 | 0 | TAP | 7 | 900kg | Google |
 ```
 
 HTML summary cards highlight:
@@ -103,3 +105,4 @@ HTML summary cards highlight:
 - Sort route search results by ascending price.
 - Dim results without pricing instead of hiding them.
 - Preserve stop counts and carbon data when the API provides them.
+- For round trips, show outbound and return leg details in the same row; the displayed price is the complete itinerary price returned after the `departure_token` step.
