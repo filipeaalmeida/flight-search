@@ -7,9 +7,9 @@ description: Search flights with Google Flights data via SerpApi. Handles destin
 
 Search flights via `search.py`. Three subcommands:
 
-- `explore` — flexible discovery or flexible-date route (writes cache JSON only).
-- `search` — specific route with exact dates or multi-city (writes cache JSON only). Round trips automatically fetch compatible return flights with `departure_token` and store complete itineraries.
-- `report` — consolidates one or more cache files into a single filterable HTML dashboard.
+- `explore` — flexible discovery / shortlist via `google_travel_explore` (writes cache JSON and terminal preview only).
+- `search` — detail selected exact candidates via `google_flights` (writes cache JSON). Round trips require `--limit` unless the user explicitly approves uncapped detail.
+- `report` — builds or updates a filterable HTML dashboard from detailed cache files. Use `--append --output <stable.html>` to keep updating the same dashboard for the same user query.
 
 `SKILL_DIR` is this skill's directory.
 
@@ -31,17 +31,21 @@ For the authoritative flag list, use the CLI's own help (cheaper than loading do
 
 - Origin only → `explore`
 - Origin + destination, dates flexible → `explore --to ...`
-- Origin + destination + exact dates → `search`
-- Multiple legs → `search --multi-city-json`
-- End of the user's turn → `report <cache_files_from_this_turn>` (one consolidated HTML)
+- Origin + destination + exact dates from a selected shortlist candidate → `search --limit 1` (or a small explicit limit)
+- Multiple exact legs → `search --multi-city-json`
+- After one or more detail searches → `report --append --output <stable_report.html> <detail_cache_files...>`
 
 ## Core rules
 
 - Reuse cache by default. `--no-cache` only on explicit user request.
-- For round trips, `search` must complete the SerpApi two-step flow: first outbound options, then return options via `departure_token`. Do not present outbound-only rows as full round trips.
-- One user request = **one** consolidated HTML via `report`. Never generate multiple HTMLs for the same turn. `explore` and `search` only write cache JSON.
-- Always include the HTML path in your response. Never auto-open the browser — ask first.
-- Follow the two-step response flow in [references/output-format.md](references/output-format.md): (1) inline preview + ask "HTML dashboard or refine?"; (2) if HTML, run `report`, show the path, ask "open in browser?".
+- Flexible requests (`from`, `to`, `after`, `before`, `month`, `4 or 5 days`, `cheap`, `compare destinations`, etc.) **must start with `explore`**. Do not expand flexible windows into a combinatorial grid of exact `search` calls.
+- `explore` is not the final product. After every exploration, show the shortlist in chat and ask what the user wants to detail. Recommended options: detail the cheapest candidate, detail the 3 cheapest candidates, choose manually, or refine the exploration.
+- Use `search` only to detail selected exact candidates from the shortlist. For round trips, `search` completes the SerpApi two-step flow: first outbound options, then return options via `departure_token`. Do not present outbound-only rows as full round trips.
+- Round-trip detail must be capped with `--limit 1` or another small explicit value. The CLI refuses uncapped round-trip detail unless `--allow-uncapped-round-trip` is passed after explicit user approval.
+- Before detailing selected candidates, tell the user the estimated number of new SerpApi requests. Cache hits cost 0.
+- HTML is produced only after detail searches, not after exploration by default. For the same user query, always update the same HTML with `report --append --output <stable_report.html> <new_detail_cache...>`. Start a new HTML only for a new independent query/session or when the user explicitly asks.
+- Always include the HTML path after running `report`. Never auto-open the browser — ask first.
+- Follow the response flow in [references/output-format.md](references/output-format.md): explore shortlist → ask what to detail → detail selected candidates → append/update the HTML.
 - Return Google Flights / Google Travel links with results.
 - For structured user-facing questions: Claude Code `AskUserQuestion`; Codex Plan Mode `request_user_input`; Codex Default Mode → numbered-list fallback (see [references/setup.md](references/setup.md) §"Structured questions").
 

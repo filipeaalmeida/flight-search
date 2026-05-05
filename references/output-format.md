@@ -2,41 +2,61 @@
 
 ## Response flow
 
-`explore` and `search` only write cache JSON (at `~/.flight-search/<hash>.json`). They do **not** write HTML per call. A single consolidated HTML dashboard is produced by `report` at the end of the user's request, combining any number of cache files.
+`explore` and `search` only write cache JSON (at `~/.flight-search/<hash>.json`). `explore` also prints a terminal shortlist. HTML is generated only after detail searches, using `report`.
 
-For round-trip `search`, the cache must contain complete itineraries. The CLI first gets outbound options, then automatically calls SerpApi again with each `departure_token` to fetch compatible return flights. Do not preview or report outbound-only rows as if they were full round trips.
+For round-trip `search`, the cache must contain complete itineraries. The CLI first gets outbound options, then automatically calls SerpApi again with each selected `departure_token` to fetch compatible return flights. Do not preview or report outbound-only rows as if they were full round trips.
 
-The CLI never opens the browser. The skill drives the UX via a two-step AskUserQuestion (Claude Code) / `ask_user_question` (Codex) flow:
+The CLI never opens the browser. The skill drives the UX via a shortlist → detail → report flow.
 
-### Step 1 — Preview inline, then ask
+### Step 1 — Explore Shortlist, Then Ask What To Detail
 
-1. Give a concise inline preview in chat (table or short list) from the structured results. Follow the column conventions under "Explore Output" / "Route Search Output" below. 5–12 rows max.
+Run `explore` first for flexible requests. Give a concise inline preview in chat (table or short list) from the structured results. Follow the column conventions under "Explore Output" below. 5–12 rows max.
+
+Exploration is not the final product. Always ask what the user wants to detail next.
+
 2. **Ask via the structured-question tool** — Claude Code `AskUserQuestion`, Codex Plan Mode `request_user_input`. In Codex Default Mode (no structured tool yet) fall back to a clean numbered list. See [setup.md](setup.md) §"Structured questions".
-   - **Header**: `Next`
+   - **Header**: `Detail`
    - **Body** (exact text):
      ```
-     What would you like to do next?
+     Which candidate(s) would you like to detail?
      ```
    - **Options** (pass each as a structured option with `label` and `description`):
-     1. label: `Show the HTML dashboard`
-        description: `Full table, summary cards, Google Flights links`
-     2. label: `Refine the search`
+     1. label: `Detail the cheapest`
+        description: `Lowest-cost candidate; usually about 2 new requests if not cached`
+     2. label: `Detail the top 3`
+        description: `More comparison; usually about 6 new requests if not cached`
+     3. label: `Choose manually`
+        description: `Tell me the row number(s) or dates to detail`
+     4. label: `Refine the search`
         description: `Adjust filters (dates, stops, airline, budget, destinations…)`
    - The tool's built-in "Chat about this" covers any other follow-up.
 
 If the user picks `Refine the search`, gather the refinement in the next turn, re-run, then come back to Step 1 with the fresh preview.
 
-### Step 2 — Generate consolidated HTML, then ask about opening
+### Step 2 — Detail Selected Candidates
 
-Only runs if the user picked `Show the HTML dashboard` in Step 1.
+Only runs after the user chooses one or more candidates to detail.
 
-1. Run the `report` subcommand with **all** cache files involved in this request (the `Data: <path>` lines printed by each `explore` / `search` call). Example:
+1. Run `search` for each selected exact candidate with a small explicit `--limit`:
+   ```bash
+   "$SKILL_DIR/.venv/bin/python" "$SKILL_DIR/search.py" search \
+     --from REC --to FLN --depart 2026-06-21 --return 2026-06-26 --limit 1
+   ```
+2. Before running, state the estimated new request count. Cache hits cost 0.
+3. Use the `Data: <path>` lines from `search` as detail cache files for the report.
+
+### Step 3 — Append/Update The HTML, Then Ask About Opening
+
+Run this only after detail searches. For the same user query, always reuse the same output path with `--append`; this updates the sidecar manifest and regenerates the same HTML.
+
+1. Run `report --append --output <stable_report.html>` with the new detail cache file(s):
    ```bash
    "$SKILL_DIR/.venv/bin/python" "$SKILL_DIR/search.py" report \
-     ~/.flight-search/abc123.json ~/.flight-search/def456.json
+     --append --output ~/.flight-search/output/rec_south_june_2026.html \
+     ~/.flight-search/abc123.json
    ```
-   The report consolidates every row into a single filterable HTML with client-side filters for origin, destination, airline, stops, price range, and date range. It prints the output path as `Report: <path>`.
-2. Tell the user, in plain text: "HTML dashboard generated at `<path>`." — **always** include the path.
+   Later detail requests for the same query use the same output path and only pass the newly detailed cache files. The manifest accumulates them.
+2. Tell the user, in plain text: "HTML dashboard updated at `<path>`." — **always** include the path.
 3. **Ask via the structured-question tool** — Claude Code `AskUserQuestion`, Codex Plan Mode `request_user_input`. In Codex Default Mode (no structured tool yet) fall back to a clean numbered list. See [setup.md](setup.md) §"Structured questions".
    - **Header**: `Open in browser?`
    - **Body** (exact text, substituting `<path>` with the real path):
@@ -54,7 +74,7 @@ Only runs if the user picked `Show the HTML dashboard` in Step 1.
    - Linux: `xdg-open "<path>"`
    - Windows: `start "" "<path>"`
 
-**Important:** never call `report` more than once per user turn. Never write per-call HTML. One search request = one consolidated HTML.
+**Important:** do not generate HTML after exploration by default. Do not create a new HTML for the same user query; append/update the existing output path. Start a new report only for a new independent query/session or when the user explicitly asks.
 
 ## Always include (in the inline preview)
 

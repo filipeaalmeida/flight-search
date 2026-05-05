@@ -8,6 +8,7 @@ import os
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import requests
 from dotenv import load_dotenv
@@ -444,6 +445,22 @@ def cache_read(key: str, ttl_hours: int) -> dict | None:
         return None
 
 
+def cache_peek(params: dict, ttl_hours: int) -> dict | None:
+    """Return a fresh cached response without printing cache-hit diagnostics."""
+    key = cache_key(params)
+    path = cache_path(key)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        cached_at = datetime.fromisoformat(data["_cached_at"])
+        if datetime.now() - cached_at > timedelta(hours=ttl_hours):
+            return None
+        return data["response"]
+    except (json.JSONDecodeError, KeyError, ValueError):
+        return None
+
+
 def cache_write(key: str, params: dict, response: dict) -> None:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     data = {
@@ -459,7 +476,11 @@ def api_request_params(params: dict) -> dict:
     return {k: v for k, v in params.items() if not k.startswith("_")}
 
 
-def api_call(params: dict, use_cache: bool = True, ttl_hours: int = DEFAULT_CACHE_TTL_HOURS) -> tuple[dict, str, Path]:
+def api_call(
+    params: dict,
+    use_cache: bool = True,
+    ttl_hours: int = DEFAULT_CACHE_TTL_HOURS,
+) -> tuple[dict, str, Path]:
     key = cache_key(params)
     cfile = cache_path(key)
 
@@ -682,9 +703,11 @@ def build_search_params(args: argparse.Namespace, api_key: str) -> dict:
         if args.oneway:
             params["type"] = 2
         else:
+            if not args.return_date:
+                print("round-trip search requires --return. Use --oneway for one-way detail.", file=sys.stderr)
+                sys.exit(1)
             params["type"] = 1
-            if args.return_date:
-                params["return_date"] = args.return_date
+            params["return_date"] = args.return_date
 
     if args.stops:
         params["stops"] = parse_stops(args.stops)
@@ -772,6 +795,70 @@ def is_initial_round_trip_search(params: dict) -> bool:
     )
 
 
+def needs_new_request(params: dict, *, use_cache: bool, ttl_hours: int) -> bool:
+    return not (use_cache and cache_peek(params, ttl_hours) is not None)
+
+
+def return_params_for_departure_token(params: dict, token: str) -> dict:
+    return_params = {
+        k: v for k, v in params.items()
+        if not k.startswith("_") and k != "api_key"
+    }
+    return_params["api_key"] = params["api_key"]
+    return_params["departure_token"] = token
+    return return_params
+
+
+def estimate_search_new_requests(
+    params: dict,
+    args: argparse.Namespace,
+    *,
+    use_cache: bool,
+    ttl_hours: int,
+) -> int:
+    if not is_initial_round_trip_search(params):
+        return 1 if needs_new_request(params, use_cache=use_cache, ttl_hours=ttl_hours) else 0
+
+    if not args.limit and not args.allow_uncapped_round_trip:
+        print(
+            "Round-trip google_flights detail requires --limit to cap departure_token requests. "
+            "Use --limit 1 for the recommended cheapest-outbound detail, or pass "
+            "--allow-uncapped-round-trip only after explicit user approval.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    limit = local_limit(params)
+    cached = cache_peek(params, ttl_hours) if use_cache else None
+    initial_miss = 0 if cached is not None else 1
+    if cached and (cached.get("_round_trip_details") or {}).get("version") == ROUND_TRIP_DETAILS_VERSION:
+        return initial_miss
+
+    if cached:
+        outbound_entries = collect_flight_entries(cached)
+        if limit is not None:
+            outbound_entries = outbound_entries[:limit]
+        return_misses = 0
+        for outbound, _ in outbound_entries:
+            token = outbound.get("departure_token")
+            if not token:
+                continue
+            return_params = return_params_for_departure_token(params, token)
+            if needs_new_request(return_params, use_cache=use_cache, ttl_hours=ttl_hours):
+                return_misses += 1
+        return initial_miss + return_misses
+
+    if limit is None:
+        print(
+            "Warning: uncapped round-trip detail cost cannot be fully estimated before the first "
+            "google_flights response. Each completed outbound option may consume one additional "
+            "departure_token request.",
+            file=sys.stderr,
+        )
+        return initial_miss
+    return initial_miss + limit
+
+
 def complete_round_trip_details(
     data: dict,
     params: dict,
@@ -806,12 +893,7 @@ def complete_round_trip_details(
             missing_tokens += 1
             continue
 
-        return_params = {
-            k: v for k, v in params.items()
-            if not k.startswith("_") and k != "api_key"
-        }
-        return_params["api_key"] = params["api_key"]
-        return_params["departure_token"] = token
+        return_params = return_params_for_departure_token(params, token)
 
         return_data, cache_info, return_cache = api_call(
             return_params,
@@ -861,34 +943,74 @@ def complete_round_trip_details(
     return len(outbound_entries), len(options), cache_counts
 
 
+def print_preview(rows: list[dict], *, limit: int, title: str) -> None:
+    if not rows or limit <= 0:
+        return
+    priced_first = sorted(
+        rows,
+        key=lambda r: (
+            float(r["price"]) if isinstance(r.get("price"), (int, float)) else 1e12,
+            r.get("depart_date") or "",
+            r.get("return_date") or "",
+            r.get("dest") or "",
+        ),
+    )
+    preview = priced_first[:limit]
+    print()
+    print(title)
+    print("| # | Type | Origin | Dest | Price | Depart | Return | Days | Duration | Airline | Stops |")
+    print("|---|------|--------|------|-------|--------|--------|------|----------|---------|-------|")
+    for idx, row in enumerate(preview, start=1):
+        price = row.get("price")
+        price_s = format_price(price, row["currency"]) if isinstance(price, (int, float)) else "—"
+        stops = row.get("stops")
+        stops_s = str(stops) if isinstance(stops, int) else "—"
+        print(
+            f"| {idx} | {row.get('type') or '—'} | {row.get('origin') or '—'} | "
+            f"{row.get('dest') or '—'} | {price_s} | {row.get('depart_date') or '—'} | "
+            f"{row.get('return_date') or '—'} | {row.get('days') or '—'} | "
+            f"{format_duration(row.get('duration_min') or 0)} | {row.get('airline') or '—'} | {stops_s} |"
+        )
+    if len(rows) > limit:
+        print(f"  Showing {limit} of {len(rows)} option(s).")
+
+
 def cmd_explore(args: argparse.Namespace) -> None:
     api_key, default_currency = load_config()
     if args.currency is None:
         args.currency = default_currency
 
     origins = [o.strip().upper() for o in args.origin.split(",")]
+    use_cache = not args.no_cache
     cache_files: list[Path] = []
+    preview_rows: list[dict] = []
     total = 0
+    params_list = [build_explore_params(origin, args, api_key) for origin in origins]
 
-    for origin in origins:
-        params = build_explore_params(origin, args, api_key)
+    for origin, params in zip(origins, params_list):
         label = f"{origin} → {args.to}" if args.to else f"from {origin}"
         print(f"Searching {label}...")
-        data, ci, cfile = api_call(params, use_cache=not args.no_cache, ttl_hours=args.cache_ttl)
+        data, ci, cfile = api_call(params, use_cache=use_cache, ttl_hours=args.cache_ttl)
         cache_files.append(cfile)
         count = len(data.get("destinations") or []) + len(collect_flights(data)) + len(data.get("flights") or [])
         total += count
         print(f"  {count} result(s) ({ci})")
+        preview_rows.extend(cache_to_rows({
+            "_params": {k: v for k, v in params.items() if k != "api_key"},
+            "response": data,
+        }))
 
     if total == 0:
         print("No results.")
         return
 
+    print_preview(preview_rows, limit=args.preview_limit, title="Explore preview (shortlist)")
     for cf in cache_files:
         print(f"  Data:  {cf}")
     print()
-    print("To build a consolidated HTML dashboard, run:")
-    print(f"  search.py report {' '.join(str(cf) for cf in cache_files)}")
+    print("Explore is a shortlist, not the final detailed itinerary.")
+    print("Ask the user which candidate(s) to detail, then run `search` with exact dates and --limit 1 or --limit 2.")
+    print("Build/update the HTML only after detail searches, using `report --append --output <stable_report.html> <detail_cache...>`.")
 
 
 def cmd_search(args: argparse.Namespace) -> None:
@@ -897,6 +1019,13 @@ def cmd_search(args: argparse.Namespace) -> None:
         args.currency = default_currency
 
     params = build_search_params(args, api_key)
+    use_cache = not args.no_cache
+    estimated_new_requests = estimate_search_new_requests(
+        params,
+        args,
+        use_cache=use_cache,
+        ttl_hours=args.cache_ttl,
+    )
 
     if args.multi_city_json:
         label = "multi-city"
@@ -905,8 +1034,9 @@ def cmd_search(args: argparse.Namespace) -> None:
         origin, dest = args.origin, args.to
         label = "one-way" if args.oneway else "round trip"
     print(f"Searching flights ({label}) {origin} → {dest}...")
+    print(f"  Estimated new SerpApi request(s): {estimated_new_requests} (cache hits cost 0)")
 
-    data, cache_info, cache_file = api_call(params, use_cache=not args.no_cache, ttl_hours=args.cache_ttl)
+    data, cache_info, cache_file = api_call(params, use_cache=use_cache, ttl_hours=args.cache_ttl)
 
     flights = collect_flights(data)
     if not flights:
@@ -916,7 +1046,7 @@ def cmd_search(args: argparse.Namespace) -> None:
     completed_outbounds, completed_options, return_cache_counts = complete_round_trip_details(
         data,
         params,
-        use_cache=not args.no_cache,
+        use_cache=use_cache,
         ttl_hours=args.cache_ttl,
     )
     if completed_outbounds:
@@ -934,8 +1064,8 @@ def cmd_search(args: argparse.Namespace) -> None:
     print(f"  {result_count} options found ({cache_info})")
     print(f"  Data:  {cache_file}")
     print()
-    print("To build a consolidated HTML dashboard, run:")
-    print(f"  search.py report {cache_file}")
+    print("To build or update the detailed HTML dashboard, run:")
+    print(f"  search.py report --append --output <stable_report.html> {cache_file}")
 
 
 # ---- report helpers -----------------------------------------------------------
@@ -1007,16 +1137,18 @@ def _explore_flight_to_row(
     dest: str,
     currency: str,
     start_date: str = "",
+    end_date: str = "",
     fallback_link: str = "",
 ) -> dict:
     """google_travel_explore flight schema: duration, number_of_stops, airline string.
 
-    The `start_date` (window start) and `google_flights_link` deep-link live at the
-    top level of the response, not on each flight object — the caller passes them
-    in so they show up as the flight's depart date and link. `end_date` is NOT
-    propagated because it represents the end of the flexible window, not a booked
-    return; showing it would wrongly imply a round-trip itinerary.
+    In route mode, Travel Explore exposes the selected round-trip dates at the
+    response top level (`start_date` and `end_date`) while individual flight rows
+    carry summary attributes only. The caller passes those dates in so reports can
+    preserve the shortlist's outbound/return dates and trip length.
     """
+    depart_date = f.get("departure_date") or f.get("start_date") or start_date
+    return_date = f.get("return_date") or f.get("end_date") or end_date
     return {
         "type": "explore-route",
         "origin": origin,
@@ -1025,11 +1157,9 @@ def _explore_flight_to_row(
         "country": "",
         "price": f.get("price"),
         "currency": currency,
-        "depart_date": f.get("departure_date") or f.get("start_date") or start_date,
-        # Only use explicit per-flight return_date. The top-level end_date is the
-        # end of the flexible window, not a booked return, so we do not inherit it.
-        "return_date": f.get("return_date") or "",
-        "days": "",
+        "depart_date": depart_date,
+        "return_date": return_date,
+        "days": _days_between(depart_date, return_date),
         "duration_min": _safe_int(f.get("duration")),
         "stops": _safe_int(f.get("number_of_stops")),
         "airline": f.get("airline") or "",
@@ -1180,19 +1310,17 @@ def cache_to_rows(cache_entry: dict) -> list[dict]:
     if engine == "google_travel_explore":
         for d in response.get("destinations") or []:
             rows.append(_explore_dest_to_row(d, origin, currency))
-        # Route mode (arrival_id set): window start and the deep-link are top-level.
-        # We intentionally do not propagate end_date because on a flight item it
-        # would be misread as a booked return.
         exp_start = response.get("start_date") or ""
+        exp_end = response.get("end_date") or ""
         exp_link = response.get("google_flights_link") or ""
         for f in response.get("flights") or []:
-            rows.append(_explore_flight_to_row(f, origin, dest, currency, exp_start, exp_link))
+            rows.append(_explore_flight_to_row(f, origin, dest, currency, exp_start, exp_end, exp_link))
         for f in response.get("best_flights") or []:
-            r = _explore_flight_to_row(f, origin, dest, currency, exp_start, exp_link)
+            r = _explore_flight_to_row(f, origin, dest, currency, exp_start, exp_end, exp_link)
             r["is_best"] = True
             rows.append(r)
         for f in response.get("other_flights") or []:
-            rows.append(_explore_flight_to_row(f, origin, dest, currency, exp_start, exp_link))
+            rows.append(_explore_flight_to_row(f, origin, dest, currency, exp_start, exp_end, exp_link))
     elif engine == "google_flights":
         if is_initial_round_trip_search(params):
             round_trip_options = response.get("round_trip_options") or []
@@ -1405,12 +1533,58 @@ def render_report_html(rows: list[dict], title: str, sources: list[dict]) -> str
     )
 
 
+def resolve_report_output(output: str | None) -> Path:
+    if output:
+        out = Path(output)
+    else:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out = OUTPUT_DIR / f"report_{ts}.html"
+    if not out.is_absolute():
+        out = (OUTPUT_DIR / out).resolve()
+    return out
+
+
+def report_manifest_path(output: Path) -> Path:
+    return output.with_suffix(output.suffix + ".manifest.json")
+
+
+def read_report_manifest(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"Failed to read report manifest {path}: {e}", file=sys.stderr)
+        sys.exit(1)
+    if not isinstance(data, dict) or not isinstance(data.get("cache_files"), list):
+        print(f"Report manifest has invalid schema: {path}", file=sys.stderr)
+        sys.exit(1)
+    return data
+
+
 def cmd_report(args: argparse.Namespace) -> None:
     if not args.inputs:
         print("report: provide at least one cache path or hash", file=sys.stderr)
         sys.exit(1)
 
-    paths = [resolve_cache_spec(s) for s in args.inputs]
+    out = resolve_report_output(args.output)
+    if args.append and not args.output:
+        print("report --append requires --output so later detail searches update the same HTML.", file=sys.stderr)
+        sys.exit(1)
+
+    input_paths = [resolve_cache_spec(s) for s in args.inputs]
+    manifest_path = report_manifest_path(out)
+    manifest = read_report_manifest(manifest_path) if args.append else None
+    paths = input_paths
+    if manifest:
+        existing = [resolve_cache_spec(str(p)) for p in manifest["cache_files"]]
+        seen = {str(p) for p in existing}
+        paths = existing[:]
+        for p in input_paths:
+            if str(p) not in seen:
+                paths.append(p)
+                seen.add(str(p))
+
     rows: list[dict] = []
     sources: list[dict] = []
 
@@ -1433,21 +1607,26 @@ def cmd_report(args: argparse.Namespace) -> None:
         print("report: no rows extracted from the inputs.", file=sys.stderr)
         sys.exit(1)
 
-    title = args.title or f"Flight Search Report — {len(rows)} options from {len(paths)} searches"
+    manifest_title = (manifest or {}).get("title") if (manifest or {}).get("custom_title") else None
+    title = args.title or manifest_title or f"Flight Search Report — {len(rows)} options from {len(paths)} searches"
     html = render_report_html(rows, title=title, sources=sources)
 
-    if args.output:
-        out = Path(args.output)
-    else:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out = OUTPUT_DIR / f"report_{ts}.html"
-    if not out.is_absolute():
-        out = (OUTPUT_DIR / out).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(html, encoding="utf-8")
+    if args.append:
+        manifest_data = {
+            "title": title,
+            "custom_title": bool(args.title) or bool((manifest or {}).get("custom_title")),
+            "report_path": str(out),
+            "cache_files": [str(p) for p in paths],
+            "updated_at": datetime.now().isoformat(),
+        }
+        manifest_path.write_text(json.dumps(manifest_data, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print(f"Report: {out}")
     print(f"  {len(rows)} option(s) from {len(paths)} cache file(s)")
+    if args.append:
+        print(f"  Manifest: {manifest_path}")
 
 
 def add_common_flags(p: argparse.ArgumentParser) -> None:
@@ -1476,12 +1655,12 @@ Examples:
   %(prog)s explore --from JFK
   %(prog)s explore --from JFK --month 7 --stops nonstop --interest beaches
   %(prog)s explore --from GRU --to LIS --month 7 --stops nonstop
-  %(prog)s search --from JFK --to LIS --depart 2026-05-15 --return 2026-05-22
+  %(prog)s search --from JFK --to LIS --depart 2026-05-15 --return 2026-05-22 --limit 1
   %(prog)s search --from JFK --to LIS --depart 2026-05-15 --oneway --sort-by price
-  %(prog)s report <cache_file_or_hash> [<cache_file_or_hash> ...]
+  %(prog)s report --append --output ~/Desktop/lisbon_detail.html <detail_cache_file>
 
-explore/search only write cache JSON. Use `report` to consolidate one or more cache
-files into a single filterable HTML dashboard.
+Explore is a shortlist. Use google_flights `search` to detail selected candidates,
+then use `report --append --output <stable.html>` to update the same dashboard.
         """,
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1493,7 +1672,7 @@ files into a single filterable HTML dashboard.
     p_explore.add_argument("--area", help="Arrival region/country filter (e.g. europe, south-america, br, pt)")
     p_explore.add_argument("--depart", help="Specific departure date (YYYY-MM-DD)")
     p_explore.add_argument("--return", dest="return_date", help="Specific return date (YYYY-MM-DD)")
-    p_explore.add_argument("--month", type=int, choices=range(0, 13), help="Month (1-12); 0 = any of the next 6 months. SerpApi rejects months beyond the next 6 from today; use `search` with specific dates for farther-out months.")
+    p_explore.add_argument("--month", type=int, choices=range(0, 13), help="Month (1-12); 0 = any of the next 6 months. SerpApi rejects months beyond the next 6 from today; ask before using exact-date detail for farther-out months.")
     p_explore.add_argument("--duration", help="Flexible duration: weekend, 1week, 2weeks")
     p_explore.add_argument("--stops", help="Stops: any, nonstop, 1, 2")
     p_explore.add_argument("--max-price", type=int, help="Maximum flight price")
@@ -1505,11 +1684,12 @@ files into a single filterable HTML dashboard.
     p_explore.add_argument("--include-airlines", help="Only these airlines (comma-separated IATA or alliance: STAR_ALLIANCE, SKYTEAM, ONEWORLD)")
     p_explore.add_argument("--exclude-airlines", help="Exclude these airlines (comma-separated IATA or alliance)")
     p_explore.add_argument("--bags", type=int, help="Carry-on bags")
+    p_explore.add_argument("--preview-limit", type=int, default=12, help="Number of shortlist rows to print in the terminal (default: 12)")
     add_common_flags(p_explore)
     p_explore.set_defaults(func=cmd_explore)
 
     # --- search ---
-    p_search = subparsers.add_parser("search", help="Search a specific route (exact dates)")
+    p_search = subparsers.add_parser("search", help="Detail selected exact candidates via google_flights")
     p_search.add_argument("--from", dest="origin", help="Origin airport IATA")
     p_search.add_argument("--to", help="Destination airport IATA")
     p_search.add_argument("--depart", help="Departure date (YYYY-MM-DD)")
@@ -1531,13 +1711,18 @@ files into a single filterable HTML dashboard.
     p_search.add_argument("--sort-by", help="Sort: top, price, departure, arrival, duration, emissions")
     p_search.add_argument("--exclude-basic", action="store_true", help="Exclude basic economy (US domestic only)")
     p_search.add_argument("--deep-search", action="store_true", help="Thorough (slower) search")
+    p_search.add_argument(
+        "--allow-uncapped-round-trip",
+        action="store_true",
+        help="Allow round-trip detail without --limit; use only after explicit user approval",
+    )
     add_common_flags(p_search)
     p_search.set_defaults(func=cmd_search)
 
     # --- report ---
     p_report = subparsers.add_parser(
         "report",
-        help="Consolidate one or more cache files into a single filterable HTML dashboard",
+        help="Build or update a filterable HTML dashboard from cache files",
     )
     p_report.add_argument(
         "inputs",
@@ -1546,6 +1731,7 @@ files into a single filterable HTML dashboard.
     )
     p_report.add_argument("--output", help="Output HTML path (default: ~/.flight-search/output/report_<ts>.html)")
     p_report.add_argument("--title", help="Custom title for the report")
+    p_report.add_argument("--append", action="store_true", help="Append input caches to the output sidecar manifest and regenerate the same HTML")
     p_report.set_defaults(func=cmd_report)
 
     args = parser.parse_args()
